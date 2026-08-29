@@ -1,0 +1,413 @@
+<!DOCTYPE html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <!-- viewport-fit=cover so the canvas can sit under notches; user-scalable=no kills pinch zoom. -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="theme-color" content="#0b0d12">
+    <title>BasketBall Hero</title>
+    <link rel="icon" type="image/png" href="TemplateData/favicon.png">
+    <link rel="apple-touch-icon" href="TemplateData/game-icon.png">
+    <link rel="stylesheet" href="TemplateData/style.css">
+  </head>
+  <body>
+    <div id="unity-container">
+      <canvas id="unity-canvas" width="1920" height="1080" tabindex="-1"></canvas>
+
+      <!-- Loading UI. Removed from the DOM once the instance is up: Safari keeps painting
+           these over the game if they are only display:none'd on a parent. -->
+
+      <!-- Full-bleed loading wallpaper, fixed for the life of the build
+           (TemplateData/loading-background.jpg, set in the stylesheet). Not partner-swappable
+           by design - changing it means a new build. -->
+      <div id="loading-backdrop"></div>
+
+      <div id="loading-bar">
+        <div id="loading-logo"></div>
+        <div id="loading-track"><div id="loading-fill"></div></div>
+        <div id="loading-percent">0%</div>
+      </div>
+
+      <div id="unity-warning"></div>
+
+      <!-- Shown only on touch devices held in portrait. Purely visual: it covers the canvas,
+           it does not pause the player, so no assumptions are made about the C# side. -->
+      <div id="rotate-overlay" hidden>
+        <div class="rotate-inner">
+          <div class="rotate-icon">
+            <svg viewBox="0 0 24 24" width="72" height="72" fill="none"
+                 stroke="currentColor" stroke-width="1.6"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="7" y="2" width="10" height="20" rx="2"></rect>
+              <path d="M3.5 14.5a9 9 0 0 0 3 5"></path>
+              <path d="M20.5 9.5a9 9 0 0 0-3-5"></path>
+              <polyline points="3.5 11 3.5 14.9 7.4 14.9"></polyline>
+              <polyline points="20.5 13 20.5 9.1 16.6 9.1"></polyline>
+            </svg>
+          </div>
+          <div class="rotate-title">Please rotate your device</div>
+          <div class="rotate-sub">This game is played in landscape</div>
+        </div>
+      </div>
+    </div>
+
+    <script>
+      // ===== Loading icon from GameBull ==========================================
+      // Takes customization.gameLogoUrl from /context and puts it on the loading
+      // screen, so the icon is whatever the platform has for this game and changing
+      // it there changes it here - no rebuild needed.
+      //
+      // The wallpaper behind it is deliberately NOT platform-driven: it ships with
+      // the build (TemplateData/loading-background.jpg, set in the stylesheet) and
+      // stays fixed. Only the ball and the court are partner-swappable, and both of
+      // those are handled inside Unity by GameBullPartnerAssets.
+      //
+      // This lives in the template rather than in C# because the loading screen is
+      // pure HTML that exists long before the Unity instance does - by the time a
+      // script inside the build could run, the thing it would style is gone.
+      //
+      // Deliberately fire-and-forget: nothing below awaits it, so the Unity download
+      // is never held up by this request. TemplateData/game-icon.png stays as the
+      // fallback, so a missing token, a missing logo or a failed request just means
+      // "no change" rather than an empty screen.
+      (function loadPlatformIcon() {
+        var DEFAULT_API_BASE = "https://api.g-b.store";
+        var FETCH_TIMEOUT_MS = 4000;
+
+        var logo = document.querySelector("#loading-logo");
+        if (!logo) return;
+
+        // Swap in the icon only after it has decoded, so a slow or broken URL never
+        // blanks what is already on screen. No crossOrigin: this ends up as a CSS
+        // background, never read back from a canvas, and requesting CORS would turn
+        // a CDN that omits the headers into an onerror - i.e. no swap at all.
+        function applyWhenDecoded(url, onReady) {
+          var img = new Image();
+          img.onload = function () { onReady(url.replace(/"/g, "%22")); };
+          img.src = url;
+        }
+
+        try {
+          var q = new URLSearchParams(window.location.search);
+
+          // Same precedence the C# side uses.
+          var token      = q.get("sessionToken") || q.get("bootToken") || q.get("token");
+          var tenantSlug = q.get("tenantSlug");
+          var gameId     = q.get("gameId");
+          var apiBase    = (q.get("apiBase") || DEFAULT_API_BASE).replace(/\/+$/, "");
+
+          // Not launched by the platform - keep the baked icon.
+          if (!token || !tenantSlug || !gameId) return;
+
+          // AbortController so a hung API cannot leave the icon in limbo.
+          var ctrl  = ("AbortController" in window) ? new AbortController() : null;
+          var timer = setTimeout(function () { if (ctrl) ctrl.abort(); }, FETCH_TIMEOUT_MS);
+
+          var url = apiBase + "/play/games/" + encodeURIComponent(gameId)
+                  + "/context?tenantSlug=" + encodeURIComponent(tenantSlug);
+
+          fetch(url, {
+            method: "GET",
+            headers: { "Authorization": "Bearer " + token },
+            signal: ctrl ? ctrl.signal : undefined
+          })
+            .then(function (r) { return r.ok ? r.json() : null; })   // 401/404 -> keep fallback
+            .then(function (data) {
+              clearTimeout(timer);
+
+              var c = data && data.customization;
+              if (!c) return;
+
+              // gameLogoUrl, never the tenant-wide logoUrl: on a shared tenant the
+              // latter is the partner's own brand mark, not this game's icon.
+              // customization.assets is deliberately ignored here - the only two
+              // custom assets this game honours, "ball" and "court", are read on the
+              // C# side by GameBullPartnerAssets.
+              var iconUrl = (typeof c.gameLogoUrl === "string" && c.gameLogoUrl)
+                          ? c.gameLogoUrl : null;
+              if (!iconUrl) return;
+
+              applyWhenDecoded(iconUrl, function (safe) {
+                logo.style.backgroundImage = 'url("' + safe + '")';
+              });
+            })
+            .catch(function () { clearTimeout(timer); });   // network / abort / CORS
+        } catch (e) {
+          /* URLSearchParams or fetch unavailable - the baked icon is already showing */
+        }
+      })();
+
+      // ============================================================================
+      //  Basketball Hero - landscape WebGL template
+      //
+      //  Layout model, per device class:
+      //
+      //    Desktop - the canvas is a fixed 16:9 box, the largest that fits the
+      //              window, centred, with letterbox bars around it. The window is
+      //              an arbitrary shape there, so pinning the aspect keeps the
+      //              composition predictable.
+      //
+      //    Touch   - the canvas fills the viewport edge to edge. A phone held in
+      //              landscape is already roughly the right shape, and bars on a
+      //              small screen waste the little space there is. The aspect then
+      //              varies with the device (a 20:9 phone shows a wider view), so
+      //              the game's own camera and CanvasScaler have to tolerate that.
+      //
+      //  Both are switchable below.
+      // ============================================================================
+
+      // ---- Tunables ----------------------------------------------------------
+      var GAME_ASPECT = 16 / 9;   // landscape; only used where letterboxing is on
+      var LETTERBOX_ON_DESKTOP = true;   // false = fill the window on desktop too
+      var LETTERBOX_ON_TOUCH   = false;  // true  = bring the 16:9 bars back on phones
+      var DPR_CAP     = 2;        // cap device pixel ratio; 3x on phones murders fps
+      var SHOW_FULLSCREEN_BUTTON = false;  // flip to true to add a corner FS button
+      // Phones only: take the browser fullscreen on the first tap, which is what
+      // actually hides the URL bar and frees up the whole screen. Silently ignored
+      // where the browser refuses (iPhone Safari has no Element.requestFullscreen).
+      var FULLSCREEN_ON_TOUCH = true;
+
+      var container = document.querySelector("#unity-container");
+      var canvas    = document.querySelector("#unity-canvas");
+      var overlay   = document.querySelector("#rotate-overlay");
+
+      var isTouch = /iPhone|iPad|iPod|Android|IEMobile|BlackBerry|Opera Mini/i.test(navigator.userAgent)
+                    || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent)); // iPadOS lies
+
+      if (isTouch) document.body.classList.add("is-touch");
+
+      // ---- Viewport size -----------------------------------------------------
+      // visualViewport is the only honest source on iOS Safari, where innerHeight
+      // includes the collapsing URL bar and leaves a strip of the page scrollable.
+      // But it can read 0 in a background/hidden tab or before first layout, and a
+      // 0 here silently collapses the canvas to nothing, so fall through every
+      // source and refuse to return a degenerate size.
+      function viewport() {
+        var vv = window.visualViewport;
+        var w = vv && vv.width  ? vv.width  : 0;
+        var h = vv && vv.height ? vv.height : 0;
+        if (!w || !h) { w = window.innerWidth;  h = window.innerHeight; }
+        if (!w || !h) { w = document.documentElement.clientWidth;
+                        h = document.documentElement.clientHeight; }
+        return { w: Math.max(1, Math.round(w)), h: Math.max(1, Math.round(h)) };
+      }
+
+      function isPortrait() {
+        var v = viewport();
+        return v.h > v.w;
+      }
+
+      // ---- Letterbox ---------------------------------------------------------
+      var retryTimer = null;
+
+      function resize() {
+        var v = viewport();
+
+        // A document that is not being rendered (hidden tab, background iframe)
+        // reports a 0-sized viewport, and neither ResizeObserver nor rAF fire
+        // there to correct us later. Never commit a degenerate layout: keep
+        // retrying on a timer, which does still run while hidden.
+        if (v.w <= 1 || v.h <= 1) {
+          if (retryTimer === null) {
+            retryTimer = setInterval(function () {
+              var n = viewport();
+              if (n.w > 1 && n.h > 1) {
+                clearInterval(retryTimer);
+                retryTimer = null;
+                resize();
+              }
+            }, 250);
+          }
+          return;
+        }
+
+        if (retryTimer !== null) { clearInterval(retryTimer); retryTimer = null; }
+
+        var letterbox = isTouch ? LETTERBOX_ON_TOUCH : LETTERBOX_ON_DESKTOP;
+        var w, h;
+
+        if (letterbox) {
+          if (v.w / v.h > GAME_ASPECT) {          // window wider than the game
+            h = v.h; w = Math.round(h * GAME_ASPECT);
+          } else {                                 // window taller than the game
+            w = v.w; h = Math.round(w / GAME_ASPECT);
+          }
+        } else {
+          w = v.w; h = v.h;                       // full bleed
+        }
+
+        canvas.style.width  = w + "px";
+        canvas.style.height = h + "px";
+        canvas.style.left   = Math.round((v.w - w) / 2) + "px";
+        canvas.style.top    = Math.round((v.h - h) / 2) + "px";
+
+        updateOverlay();
+      }
+
+      function updateOverlay() {
+        if (!overlay) return;
+        overlay.hidden = !(isTouch && isPortrait());
+      }
+
+      window.addEventListener("resize", resize);
+      window.addEventListener("orientationchange", function () {
+        // Some Androids report the old size for a frame or two after the rotation.
+        setTimeout(resize, 50);
+        setTimeout(resize, 300);
+      });
+      if (window.visualViewport) {
+        window.visualViewport.addEventListener("resize", resize);
+        window.visualViewport.addEventListener("scroll", resize);
+      }
+      // The container is inset:0, so observing it catches every layout change -
+      // including the very first one, which the events above can miss when the
+      // page starts life hidden and the initial measurement comes back as 0.
+      if (window.ResizeObserver) new ResizeObserver(resize).observe(container);
+      window.addEventListener("load",    resize);
+      window.addEventListener("pageshow", resize);
+      // Entering or leaving fullscreen resizes the viewport without always firing a
+      // window resize first, which would otherwise leave the canvas the old size.
+      document.addEventListener("fullscreenchange", resize);
+      document.addEventListener("webkitfullscreenchange", resize);
+      document.addEventListener("visibilitychange", function () {
+        if (!document.hidden) resize();
+      });
+      resize();
+
+      // ---- Kill browser gestures that fight a game ---------------------------
+      // Pinch-zoom, double-tap-to-zoom, rubber-band scroll, long-press menu.
+      document.addEventListener("gesturestart",  function (e) { e.preventDefault(); }, { passive: false });
+      document.addEventListener("gesturechange", function (e) { e.preventDefault(); }, { passive: false });
+      document.addEventListener("dblclick",      function (e) { e.preventDefault(); }, { passive: false });
+      document.addEventListener("contextmenu",   function (e) { e.preventDefault(); });
+      document.addEventListener("touchmove", function (e) {
+        if (e.touches.length > 1) e.preventDefault();   // multi-touch = pinch
+      }, { passive: false });
+      // Safari still zooms on a fast double tap even with user-scalable=no.
+      var lastTouchEnd = 0;
+      document.addEventListener("touchend", function (e) {
+        var now = Date.now();
+        if (now - lastTouchEnd <= 300) e.preventDefault();
+        lastTouchEnd = now;
+      }, { passive: false });
+
+      // ---- Orientation lock --------------------------------------------------
+      // Browsers only honour this from a user gesture, and most only while
+      // fullscreen. Best-effort: every failure path is silent.
+      function tryLockLandscape() {
+        try {
+          var so = screen.orientation;
+          if (so && so.lock) { var p = so.lock("landscape"); if (p && p.catch) p.catch(function(){}); }
+        } catch (e) {}
+      }
+      function goFullscreen() {
+        var el = document.documentElement;
+        var fn = el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+        if (fn) { try { var p = fn.call(el); if (p && p.catch) p.catch(function(){}); } catch (e) {} }
+        tryLockLandscape();
+      }
+
+      // Both of the above only work from inside a user gesture. On a phone go
+      // fullscreen as well - that is what drops the URL bar and gives the game the
+      // whole screen; the orientation lock also tends to be refused outside it.
+      function onFirstGesture() {
+        if (isTouch && FULLSCREEN_ON_TOUCH) goFullscreen();
+        else tryLockLandscape();
+        // The viewport changes shape as the browser chrome collapses, and phones
+        // report the new size a beat late.
+        setTimeout(resize, 100);
+        setTimeout(resize, 600);
+      }
+      window.addEventListener("touchend", onFirstGesture, { once: true });
+      window.addEventListener("click",    onFirstGesture, { once: true });
+
+      // ---- Loading UI --------------------------------------------------------
+      function setProgress(p) {
+        var pct  = Math.round(p * 100);
+        var fill = document.querySelector("#loading-fill");
+        var txt  = document.querySelector("#loading-percent");
+        if (fill) fill.style.width = pct + "%";
+        if (txt)  txt.textContent  = pct + "%";
+      }
+
+      function unityShowBanner(msg, type) {
+        var banner = document.querySelector("#unity-warning");
+        if (!banner) return;
+        var div = document.createElement("div");
+        div.innerHTML = msg;
+        div.className = (type === "error") ? "warn-error" : "warn-warning";
+        banner.appendChild(div);
+        if (type !== "error") {
+          setTimeout(function () {
+            if (div.parentNode) div.parentNode.removeChild(div);
+          }, 5000);
+        }
+      }
+
+      // ---- Boot Unity --------------------------------------------------------
+      var buildUrl  = "Build";
+      var loaderUrl = buildUrl + "/ProductionBuild.loader.js";
+
+      var config = {
+        arguments: [],
+        dataUrl: buildUrl + "/ProductionBuild.data.unityweb",
+        frameworkUrl: buildUrl + "/ProductionBuild.framework.js.unityweb",
+        codeUrl: buildUrl + "/ProductionBuild.wasm.unityweb",
+        streamingAssetsUrl: "StreamingAssets",
+        companyName: "ASN Games",
+        productName: "BasketBall Hero",
+        productVersion: "1.0",
+        showBanner: unityShowBanner,
+        // Render buffer follows the letterboxed CSS size -> no distortion, no
+        // wasted pixels in the black bars.
+        matchWebGLToCanvasSize: true,
+        devicePixelRatio: Math.min(window.devicePixelRatio || 1, DPR_CAP),
+        // Opt in to automatic persistentDataPath syncing. Without this Unity logs a
+        // deprecation warning about manual JS_FileSystem_Sync() on every boot.
+        autoSyncPersistentDataPath: true
+      };
+
+      document.querySelector("#loading-bar").style.display = "block";
+
+      var script = document.createElement("script");
+      script.src = loaderUrl;
+      script.onload = function () {
+        createUnityInstance(canvas, config, setProgress).then(function (unityInstance) {
+          window.unityInstance = unityInstance;
+
+          setProgress(1);   // Unity's own progress plateaus around 0.9
+
+          // Remove, don't just hide - WebKit keeps compositing hidden children.
+          ["#loading-logo", "#loading-track", "#loading-fill", "#loading-percent",
+           "#loading-bar", "#loading-backdrop"]
+            .forEach(function (sel) {
+              var el = document.querySelector(sel);
+              if (el && el.parentNode) el.parentNode.removeChild(el);
+            });
+
+          resize();
+
+          if (SHOW_FULLSCREEN_BUTTON) {
+            var btn = document.createElement("button");
+            btn.id = "fullscreen-btn";
+            btn.type = "button";
+            btn.setAttribute("aria-label", "Fullscreen");
+            btn.textContent = "⛶";
+            btn.addEventListener("click", function () {
+              if (unityInstance.SetFullscreen) unityInstance.SetFullscreen(1);
+              else goFullscreen();
+            });
+            container.appendChild(btn);
+          }
+        }).catch(function (message) {
+          unityShowBanner(message, "error");
+        });
+      };
+      document.body.appendChild(script);
+    </script>
+  </body>
+</html>
